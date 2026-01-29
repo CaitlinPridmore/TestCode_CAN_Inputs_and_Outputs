@@ -1,0 +1,91 @@
+#include <Arduino.h>
+#include <pwm.h>
+
+// PWM pins
+PwmOut pwmA(6);
+PwmOut pwmB(9);
+PwmOut pwmC(10);
+PwmOut pwmD(11);
+
+// Current values
+uint32_t freq[4] = {1000, 1000, 1000, 1000}; // default 1 kHz
+uint8_t duty[4] = {128, 128, 128, 128};      // default 50% (0-255)
+
+// Map indices to PWM objects
+PwmOut* pwm[4] = {&pwmA, &pwmB, &pwmC, &pwmD};
+uint8_t pins[4] = {6, 9, 10, 11};
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);  // wait for Serial
+
+  Serial.println("4-PWM Independent Adjustable Test");
+  Serial.println("Enter 8 numbers: freqA dutyA freqB dutyB freqC dutyC freqD dutyD");
+  Serial.println("Duty values 0-100 (%)");
+
+  analogWriteResolution(12); // 12-bit PWM
+
+  // Initialize all PWM channels
+  for (int i = 0; i < 4; i++) {
+    uint32_t period_us = 1000000 / freq[i];
+    pwm[i]->begin(period_us, 0);
+    analogWrite(pins[i], duty[i] * 4095 / 255);  // scale 0-255 → 0-4095
+  }
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String line = Serial.readStringUntil('\n');
+    line.trim(); // remove spaces
+
+    // Split input into 8 numbers
+    uint32_t newFreq[4];
+    uint8_t newDuty[4]; // 0-255 internally
+    int index = 0;
+    char* token;
+    char buf[100];
+    line.toCharArray(buf, sizeof(buf));
+    token = strtok(buf, " ");
+    while (token != NULL && index < 8) {
+      uint32_t val = atol(token);
+      if (index % 2 == 0) { // frequency
+        newFreq[index/2] = val;
+      } else { // duty 0-100 from Serial
+        if (val > 100) val = 100; // clamp
+        newDuty[index/2] = (uint8_t)(val * 255 / 100); // convert % → 0-255
+      }
+      index++;
+      token = strtok(NULL, " ");
+    }
+
+    if (index != 8) {
+      Serial.println("Invalid input! Must enter 8 numbers: freqA dutyA freqB dutyB freqC dutyC freqD dutyD");
+      return;
+    }
+
+    // Safety checks and apply
+    for (int i = 0; i < 4; i++) {
+      if (newFreq[i] < 1 || newFreq[i] > 100000) {
+        Serial.print("Frequency out of range for pin "); Serial.println(pins[i]);
+        return;
+      }
+
+      // Apply PWM
+      uint32_t period_us = 1000000 / newFreq[i];
+      pwm[i]->begin(period_us, 0);
+      analogWrite(pins[i], newDuty[i] * 4095 / 255); // scale to 12-bit
+
+      // Save current values
+      freq[i] = newFreq[i];
+      duty[i] = newDuty[i];
+    }
+
+    Serial.println("Updated PWM channels:");
+    for (int i = 0; i < 4; i++) {
+      Serial.print("Pin "); Serial.print(pins[i]);
+      Serial.print(": Freq = "); Serial.print(freq[i]);
+      Serial.print(" Hz, Duty = "); Serial.print((duty[i] * 100 / 255));
+      Serial.println("%");
+    }
+  }
+}
