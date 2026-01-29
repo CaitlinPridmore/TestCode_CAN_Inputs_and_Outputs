@@ -1,0 +1,126 @@
+// DPO Byte	Value
+// 0	0x01 → PWM_OUTPUT_CMD
+// 1	Channel (0 or 1)
+// 2	Duty (0–100)
+// 3	Reserved (0)
+// 4	Frequency LSB
+// 5	Frequency MSB
+// 6	0
+// 7	0
+
+// KeepALive Byte	Field	Description
+// 0	Message Type	0x02 for KeepAlive
+// 1	Node ID	0x01 = UNO R4 Minima, 0x02 = Nano (example)
+// 2	Status Flags	Bitfield for error/warning/status (0x00 = OK)
+// 3	Sequence Counter	Incremented every KeepAlive frame (0–255)
+// 4	Uptime LSB	Milliseconds/seconds LSB (mod 256, e.g., uptime % 256)
+// 5	Uptime MSB	Milliseconds/seconds MSB
+// 6	Reserved	0x00 for future use
+// 7	Checksum	Simple XOR of bytes 0–6
+
+#include <Arduino_CAN.h>
+
+#define PWM_CMD_ID        0x2D0      // DPOrxCANAddress1
+#define PWM_CMD_TYPE      0x01
+#define KEEPALIVE_ID      0x2C6      // KeepAlive frame
+#define KEEPALIVE_INTERVAL_MS 100     // Send every 100ms
+
+static uint8_t keepaliveSeq = 0;
+
+unsigned long lastKeepAlive = 0;
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("UNO R4 CAN PWM Controller");
+  Serial.println("Type: pwm <channel> <freqHz> <duty%>");
+  Serial.println("Example: pwm 0 1000 50");
+
+  if (!CAN.begin(CanBitRate::BR_1000k)) {
+    Serial.println("CAN init failed");
+    while (1);
+  }
+
+  Serial.println("CAN ready");
+}
+
+void loop() {
+  unsigned long now = millis();
+
+  // ---- Send KeepAlive ----
+  if (now - lastKeepAlive >= KEEPALIVE_INTERVAL_MS) {
+    sendKeepAlive();
+    lastKeepAlive = now;
+  }
+
+  // ---- Serial command parser ----
+  if (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("pwm")) {
+      handlePWMCommand(line);
+    } else {
+      Serial.println("Unknown command");
+    }
+  }
+}
+
+void handlePWMCommand(String cmd) {
+  int channel, freq, duty;
+  int parsed = sscanf(cmd.c_str(), "pwm %d %d %d", &channel, &freq, &duty);
+  if (parsed != 3) {
+    Serial.println("Format error. Use: pwm <ch> <freq> <duty>");
+    return;
+  }
+  if (channel < 0 || channel > 1 || freq <= 0 || freq > 20000 || duty < 0 || duty > 100) {
+    Serial.println("Invalid parameters");
+    return;
+  }
+  sendPWMCan(channel, freq, duty);
+
+  // ---- Small delay to prevent CAN buffer overflow ----
+  delay(5);  // 5ms
+}
+
+void sendPWMCan(uint8_t channel, uint16_t freq, uint8_t duty) {
+  uint8_t data[8] = {0};
+  data[0] = PWM_CMD_TYPE;
+  data[1] = channel;
+  data[2] = duty;
+  data[3] = 0;
+  data[4] = freq & 0xFF;
+  data[5] = (freq >> 8) & 0xFF;
+  data[6] = 0;
+  data[7] = 0;
+
+  CanMsg msg(CanStandardId(PWM_CMD_ID), 8, data);
+  int rc = CAN.write(msg);
+  if (rc < 0) Serial.print("CAN send failed: "), Serial.println(rc);
+  else {
+    Serial.print("Sent PWM → ch=");
+    Serial.print(channel);
+    Serial.print(" freq=");
+    Serial.print(freq);
+    Serial.print("Hz duty=");
+    Serial.print(duty);
+    Serial.println("%");
+  }
+}
+
+void sendKeepAlive() {
+  uint8_t data[8] = {0};
+  data[0] = 0x02;               // KeepAlive message type
+  data[1] = 0x01;               // Node ID (UNO)
+  data[2] = 0x00;               // Status flags OK
+  data[3] = keepaliveSeq++;     // Sequence
+  uint16_t uptime = millis() / 1000; // seconds
+  data[4] = uptime & 0xFF;      // LSB
+  data[5] = (uptime >> 8) & 0xFF;// MSB
+  data[6] = 0x00;               // Reserved
+  data[7] = data[0]^data[1]^data[2]^data[3]^data[4]^data[5]^data[6]; // Checksum
+
+  CanMsg msg(CanStandardId(KEEPALIVE_ID), 8, data);
+  CAN.write(msg);
+}
