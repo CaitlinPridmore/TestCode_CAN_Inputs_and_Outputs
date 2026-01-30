@@ -1,0 +1,114 @@
+#include <Arduino.h>
+#include <pwm.h>  // Use PWM library for hardware PWM outputs
+
+const int PIN = 6;           // Only using pin D6 for output
+uint32_t freq[1] = {1000};   // Default 1 kHz
+uint8_t duty[1] = {50};      // Default 50% duty (0-100%)
+
+unsigned long lastReadTime = 0;
+const unsigned long READ_INTERVAL = 1000; // ms
+
+bool isOutput = false;       // Track current mode
+PwmOut pwm6(PIN);            // PWM object for pin 6
+
+// ------------------------------
+// Safely switch to INPUT and read pin
+// ------------------------------
+void switchToInput() {
+  if (isOutput) {
+    pwm6.end();             // Stop PWM
+    pinMode(PIN, OUTPUT);   // Preload LOW safely
+    digitalWrite(PIN, LOW);
+    pinMode(PIN, INPUT);    // Hi-Z input
+    delayMicroseconds(5);   // Allow settling
+    isOutput = false;
+  }
+  
+  Serial.print("MODE: INPUT");
+  Serial.println(); // blank line for spacing
+}
+
+// ------------------------------
+// Safely switch to OUTPUT
+// ------------------------------
+void switchToOutput() {
+  pinMode(PIN, OUTPUT);
+  digitalWrite(PIN, LOW);    // Preload LOW to avoid glitches
+  pwm6.begin(1000000UL / freq[0], (duty[0] * 10000UL) / 100); // Initial PWM
+  isOutput = true;
+
+  Serial.println("Pin set to OUTPUT");
+  Serial.println(); // blank line for spacing
+}
+
+// ------------------------------
+// Set PWM frequency and duty cycle (0-100%)
+// ------------------------------
+void setPWM(uint32_t newFreq, uint8_t newDuty) {
+  if (!isOutput) {
+    Serial.println("ERROR: Pin is not OUTPUT");
+    return;
+  }
+
+  freq[0] = newFreq;
+  duty[0] = (newDuty > 100) ? 100 : newDuty; // cap at 100
+
+  uint32_t period_us = 1000000UL / freq[0];        // period in microseconds
+  uint32_t pulse_us = (period_us * duty[0]) / 100; // high time based on duty
+
+  pwm6.begin(period_us, pulse_us);
+
+  Serial.print("PWM set: ");
+  Serial.print(freq[0]);
+  Serial.print(" Hz, Duty: ");
+  Serial.print(duty[0]);
+  Serial.println("%");
+}
+
+// ------------------------------
+// Setup
+// ------------------------------
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  switchToInput(); // Start in input mode
+  Serial.println("Ready.");
+  Serial.println("Commands: in, out, pwm <freq> <duty 0-100>");
+}
+
+// ------------------------------
+// Serial Command Handler
+// ------------------------------
+void loop() {
+    // Non-blocking serial command check
+    if (Serial.available() > 0) {
+        String cmd = Serial.readStringUntil('\n');
+        cmd.trim();
+
+        if (cmd == "in") {
+            switchToInput();
+        } else if (cmd == "out") {
+            switchToOutput();
+        } else if (cmd.startsWith("pwm")) {
+            uint32_t newFreq;
+            uint8_t newDuty;
+            int parsed = sscanf(cmd.c_str(), "pwm %lu %hhu", &newFreq, &newDuty);
+            if (parsed == 2) setPWM(newFreq, newDuty);
+            else Serial.println("ERROR: Use pwm <freq> <duty 0-100>");
+        } else {
+            Serial.println("Unknown command");
+        }
+    }
+
+    // Continuous input read (non-blocking)
+    if (!isOutput) {
+        unsigned long currentMillis = millis();
+        if (currentMillis - lastReadTime >= READ_INTERVAL) {
+            int val = digitalRead(PIN);
+            Serial.print("MODE: INPUT, Pin reads: ");
+            Serial.println(val);
+            lastReadTime = currentMillis;
+        }
+    }
+}
