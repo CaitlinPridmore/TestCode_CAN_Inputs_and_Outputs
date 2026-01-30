@@ -1,0 +1,77 @@
+#include <Arduino.h>
+
+#define NUM_OUTPUTS 4
+
+// Assign PWM pins
+const uint8_t pwmPins[NUM_OUTPUTS] = {3, 5, 6, 9};
+
+// Store current output settings
+uint16_t outputFreq[NUM_OUTPUTS] = {1000, 1000, 1000, 1000}; // Hz
+float outputDuty[NUM_OUTPUTS] = {50, 50, 50, 50};           // %
+
+unsigned long lastMicros[NUM_OUTPUTS] = {0};
+bool pinState[NUM_OUTPUTS] = {false};
+
+// Function to set frequency and duty for a pin
+void setOutput(uint8_t channel, uint16_t freq, float duty) {
+  if (channel >= NUM_OUTPUTS) return;
+  outputFreq[channel] = freq;
+  outputDuty[channel] = constrain(duty, 0.0, 100.0);
+  Serial.print("Set pin ");
+  Serial.print(pwmPins[channel]);
+  Serial.print(" -> Freq: ");
+  Serial.print(freq);
+  Serial.print("Hz, Duty: ");
+  Serial.print(outputDuty[channel]);
+  Serial.println("%");
+}
+
+void setup() {
+  Serial.begin(115200);
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    pinMode(pwmPins[i], OUTPUT);
+    lastMicros[i] = micros();
+    pinState[i] = false;
+  }
+
+  Serial.println("PWM Test Nano Ready!");
+  Serial.println("Enter command: channel,freq,duty (e.g., 0,500,75)");
+}
+
+void loop() {
+  // 1. Update software PWM outputs
+  unsigned long now = micros();
+  for (int i = 0; i < NUM_OUTPUTS; i++) {
+    if (outputFreq[i] == 0) continue; // avoid divide by zero
+    unsigned long period = 1000000UL / outputFreq[i]; // period in microseconds
+    unsigned long highTime = period * outputDuty[i] / 100.0;
+
+    if (!pinState[i] && now - lastMicros[i] >= (period - highTime)) {
+      pinState[i] = true;
+      digitalWrite(pwmPins[i], HIGH);
+      lastMicros[i] = now;
+    }
+    else if (pinState[i] && now - lastMicros[i] >= highTime) {
+      pinState[i] = false;
+      digitalWrite(pwmPins[i], LOW);
+      lastMicros[i] = now;
+    }
+  }
+
+  // 2. Read Serial input to adjust PWM
+  if (Serial.available()) {
+    String input = Serial.readStringUntil('\n');
+    input.trim();
+
+    int comma1 = input.indexOf(',');
+    int comma2 = input.lastIndexOf(',');
+
+    if (comma1 > 0 && comma2 > comma1) {
+      int channel = input.substring(0, comma1).toInt();
+      int freq    = input.substring(comma1 + 1, comma2).toInt();
+      float duty  = input.substring(comma2 + 1).toFloat();
+
+      setOutput(channel, freq, duty);
+    }
+  }
+}
