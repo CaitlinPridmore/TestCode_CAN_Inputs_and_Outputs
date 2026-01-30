@@ -1,0 +1,120 @@
+// include libraries
+#include <Arduino.h> // Core Arduino functions
+#include <Arduino_CAN.h>
+#include <EEPROM.h>
+
+#define NUM_DIGITAL 4
+#define SIGNAL_TIMEOUT_US 200000  // 200 ms timeout
+
+const uint8_t digitalInPins[NUM_DIGITAL] = {2, 3, 8, 12};
+
+uint8_t  digitalState[NUM_DIGITAL]; // HIGH or LOW
+uint16_t digitalFreq[NUM_DIGITAL]; // Frequency in Hz
+float    digitalDuty[NUM_DIGITAL]; // duty  cycle %
+
+struct DigitalInputState {
+    volatile unsigned long lastRiseTime;
+    volatile unsigned long risingTime;
+    volatile unsigned long highTime;
+    volatile unsigned long periodTime;
+    volatile bool newSignal;
+    volatile bool lastState;
+};
+
+DigitalInputState di[NUM_DIGITAL];
+
+// -------- ISR core --------
+void handleChange(int idx) {
+    bool current = digitalRead(digitalInPins[idx]);
+    unsigned long now = micros();
+
+    // Rising edge
+    if (current && !di[idx].lastState) {
+        di[idx].periodTime = now - di[idx].lastRiseTime;
+        di[idx].lastRiseTime = now;
+        di[idx].risingTime = now;
+    }
+
+    // Falling edge
+    if (!current && di[idx].lastState) {
+        di[idx].highTime = now - di[idx].risingTime;
+        di[idx].newSignal = true;
+    }
+
+    di[idx].lastState = current;
+}
+
+// ISR wrappers
+void ISR_DI0() { handleChange(0); }
+void ISR_DI1() { handleChange(1); }
+void ISR_DI2() { handleChange(2); }
+void ISR_DI3() { handleChange(3); }
+
+// -------- Setup --------
+void setup() {
+    Serial.begin(115200); // Initalise serial monitor
+
+    for (int i = 0; i < NUM_DIGITAL; i++) {
+        pinMode(digitalInPins[i], INPUT);
+        di[i] = { micros(), 0, 0, 0, false, digitalRead(digitalInPins[i]) };
+
+        digitalFreq[i] = 0;
+        digitalDuty[i] = 0.0f;
+    }
+// attach Interrupts to detect rising/falling edges
+    attachInterrupt(digitalInPins[0], ISR_DI0, CHANGE);
+    attachInterrupt(digitalInPins[1], ISR_DI1, CHANGE);
+    attachInterrupt(digitalInPins[2], ISR_DI2, CHANGE);
+    attachInterrupt(digitalInPins[3], ISR_DI3, CHANGE);
+}
+
+// -------- Update --------
+void updateDigitalMeasurements() {
+    unsigned long now = micros();
+
+    for (int i = 0; i < NUM_DIGITAL; i++) {
+        digitalState[i] = digitalRead(digitalInPins[i]);
+
+        unsigned long p, h, lastRise;
+        bool newSig;
+
+        noInterrupts();
+        newSig = di[i].newSignal;
+        p = di[i].periodTime;
+        h = di[i].highTime;
+        lastRise = di[i].lastRiseTime;
+        di[i].newSignal = false;
+        interrupts();
+
+        // ----- Signal timeout -----
+        if ((now - lastRise) > SIGNAL_TIMEOUT_US) {
+            digitalFreq[i] = 0;
+            digitalDuty[i] = 0.0f;
+            continue;
+        }
+
+        // ----- Valid update -----
+        if (newSig && p > 0) {
+            digitalFreq[i] = 1000000UL / p;
+            digitalDuty[i] = constrain(100.0f * h / p, 0.0f, 100.0f);
+        }
+    }
+}
+
+// -------- Print --------
+void printDigitalInputs() {
+    char buffer[128];
+    for (int i = 0; i < NUM_DIGITAL; i++) {
+        snprintf(buffer, sizeof(buffer),
+                 "DI%d: State=%d Freq=%dHz Duty=%.2f%%",
+                 i, digitalState[i], digitalFreq[i], digitalDuty[i]);
+        Serial.println(buffer);
+    }
+    Serial.println("------------------");
+}
+
+void loop() {
+    updateDigitalMeasurements();
+    printDigitalInputs();
+    delay(500);
+}
