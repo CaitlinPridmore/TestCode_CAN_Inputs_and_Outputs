@@ -1,0 +1,238 @@
+#include <Arduino_CAN.h>
+#include <Arduino.h>
+#include <pwm.h>
+
+#define PWM_CMD_ID        0x2D0
+#define PWM_CMD_TYPE      0x01
+#define KEEPALIVE_ID      0x2C6
+#define DIGITAL_OUTPUT_CAN_ID 0x2D2
+#define KEEPALIVE_INTERVAL_MS 100
+#define NANO_TIMEOUT_MS   300
+
+static uint8_t keepaliveSeq = 0;
+unsigned long lastKeepAliveSent = 0;
+unsigned long lastNanoKeepAlive = 0;
+
+/* ---------- PWM OUTPUTS ---------- */
+PwmOut pwmA(6);
+PwmOut pwmB(9);
+PwmOut pwmC(10);
+PwmOut pwmD(11);
+
+/* ---------- STATE ---------- */
+uint32_t freq[4] = {1000, 1000, 1000, 1000};
+uint8_t duty[4]  = {50, 50, 50, 50};
+
+PwmOut* pwm[4] = {&pwmA, &pwmB, &pwmC, &pwmD};
+uint8_t digitalPins[4] = {6, 9, 10, 11};
+
+
+/* ---------- APPLY PWM ---------- */
+void applyDigitalPWM(uint8_t ch, uint32_t newFreq, uint8_t newDuty)
+{
+  if (ch >= 4) return;
+
+  if (newDuty > 100) newDuty = 100;
+
+  freq[ch] = newFreq;
+  duty[ch] = newDuty;
+
+  uint32_t period_us = 1000000UL / freq[ch];
+
+  pwm[ch]->begin(period_us, 0);
+
+  uint16_t val = (uint16_t)(duty[ch] * 4095UL / 100UL);
+  analogWrite(digitalPins[ch], val);
+}
+
+
+/* ---------- SETUP ---------- */
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("UNO R4 CAN PWM Controller (4CH)");
+
+  if (!CAN.begin(CanBitRate::BR_1000k)) {
+    Serial.println("CAN init failed");
+    while (1);
+  }
+
+  Serial.println("CAN ready");
+
+  analogWriteResolution(12);
+
+  enterSafeState();
+
+  for (uint8_t i = 0; i < 4; i++) {
+    applyDigitalPWM(i, freq[i], duty[i]);
+  }
+
+  Serial.println("PWM outputs initialized");
+}
+
+
+/* ---------- LOOP ---------- */
+void loop()
+{
+  unsigned long now = millis();
+
+  /* ---- KeepAlive ---- */
+  if (now - lastKeepAliveSent >= KEEPALIVE_INTERVAL_MS) {
+    sendKeepAlive();
+    lastKeepAliveSent = now;
+  }
+
+  /* ---- CAN Receive ---- */
+  if (CAN.available()) {
+    CanMsg msg = CAN.read();
+
+    if (msg.id == PWM_CMD_ID && msg.data_length == 8) {
+      handlePWMCan(msg);
+      delay(5);
+    }
+
+    if (msg.id == KEEPALIVE_ID && msg.data_length == 8) {
+      lastNanoKeepAlive = now;
+    }
+  }
+
+  /* ---- Watchdog ---- */
+  if (now - lastNanoKeepAlive > NANO_TIMEOUT_MS) {
+    Serial.println("ERROR: Nano timeout → SAFE STATE");
+    enterSafeState();
+    lastNanoKeepAlive = now;
+  }
+
+  /* ---- Serial Control ---- */
+  if (Serial.available()) {
+
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line.startsWith("pwm")) {
+      handlePWMCommand(line);
+    }
+    else {
+      Serial.println("Unknown command");
+    }
+  }
+}
+
+
+/* ---------- SAFE STATE ---------- */
+void enterSafeState()
+{
+  uint8_t data[8] = {0};
+
+  data[0] = PWM_CMD_TYPE;
+
+  for (uint8_t ch = 0; ch < 2; ch++) {
+
+    data[1] = ch;
+
+    CanMsg msg(CanStandardId(PWM_CMD_ID), 8, data);
+    CAN.write(msg);
+  }
+
+  for (uint8_t i = 0; i < 4; i++) {
+    applyDigitalPWM(i, 1000, 0);
+  }
+
+  Serial.println("SAFE STATE active");
+}
+
+
+/* ---------- SEND PWM CAN ---------- */
+void sendPWMCan(uint8_t channel, uint16_t freq, uint8_t duty)
+{
+  uint8_t data[8] = {0};
+
+  data[0] = PWM_CMD_TYPE;
+  data[1] = channel;
+  data[2] = duty;
+  data[4] = freq & 0xFF;
+  data[5] = (freq >> 8) & 0xFF;
+
+  CanMsg msg(CanStandardId(PWM_CMD_ID), 8, data);
+
+  CAN.write(msg);
+
+  Serial.print("Sent PWM → ch=");
+  Serial.print(channel);
+  Serial.print(" f=");
+  Serial.print(freq);
+  Serial.print("Hz d=");
+  Serial.print(duty);
+  Serial.println("%");
+}
+
+
+/* ---------- KEEPALIVE ---------- */
+void sendKeepAlive()
+{
+  uint8_t data[8] = {0};
+
+  data[0] = 0x02;
+  data[1] = 0x01;
+  data[3] = keepaliveSeq++;
+
+  uint16_t uptime = millis() / 1000;
+
+  data[4] = uptime & 0xFF;
+  data[5] = uptime >> 8;
+
+  data[7] =
+    data[0]^data[1]^data[2]^data[3]^
+    data[4]^data[5]^data[6];
+
+  CanMsg msg(CanStandardId(KEEPALIVE_ID), 8, data);
+
+  CAN.write(msg);
+}
+
+
+/* ---------- HANDLE PWM CAN ---------- */
+void handlePWMCan(CanMsg msg)
+{
+  if (msg.data_length != 8) return;
+
+  uint8_t channel = msg.data[1];
+  uint8_t duty    = msg.data[2];
+  uint16_t freq   = (msg.data[5] << 8) | msg.data[4];
+
+  sendPWMCan(channel, freq, duty);
+}
+
+
+/* ---------- SERIAL COMMAND ---------- */
+void handlePWMCommand(String cmd)
+{
+  int channel, freq, duty;
+
+  int parsed =
+    sscanf(cmd.c_str(), "pwm %d %d %d",
+           &channel, &freq, &duty);
+
+  if (parsed != 3) {
+    Serial.println("Use: pwm <ch> <freq> <duty>");
+    return;
+  }
+
+  if (channel < 0 || channel > 3 ||
+      freq <= 0 || freq > 20000 ||
+      duty < 0 || duty > 100) {
+
+    Serial.println("Invalid parameters");
+    return;
+  }
+
+  /* Apply locally */
+  applyDigitalPWM(channel, freq, duty);
+
+  /* Send to Nano */
+  sendPWMCan(channel, freq, duty);
+
+  delay(5);
+}
