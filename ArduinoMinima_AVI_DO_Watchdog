@@ -1,0 +1,296 @@
+#include <Arduino_CAN.h>
+#include <Arduino.h>
+#include <pwm.h>
+
+#define DO_CMD_TYPE      0x10
+#define KEEPALIVE_ID      0x2C6
+#define DIGITAL_OUTPUT_CAN_ID 0x2D2
+#define KEEPALIVE_INTERVAL_MS 100
+#define NANO_TIMEOUT_MS   300
+
+const uint32_t AVIsendCANAddress = 0x2C0;
+
+// Analog
+#define NUM_ANALOG 4
+
+const uint8_t analogPins[NUM_ANALOG] = { A0, A1, A2, A3 };
+
+uint16_t analogValues[NUM_ANALOG];
+
+static uint8_t keepaliveSeq = 0;
+unsigned long lastKeepAliveSent = 0;
+unsigned long lastNanoKeepAlive = 0;
+unsigned long lastSerialMonitor = 0;
+unsigned long lastAnalogSend = 0;
+const unsigned long ANALOG_INTERVAL = 5; // ms
+
+
+uint8_t calcChecksum(uint8_t* data)
+{
+  uint8_t c = 0;
+
+  for (int i = 0; i < 7; i++) {
+    c ^= data[i];
+  }
+
+  return c;
+}
+
+// PWM Outputs
+PwmOut pwmA(6);
+PwmOut pwmB(9);
+PwmOut pwmC(10);
+PwmOut pwmD(11);
+
+// State
+uint32_t freq[4] = {1000, 1000, 1000, 1000};
+uint8_t duty[4]  = {50, 50, 50, 50};
+
+PwmOut* pwm[4] = {&pwmA, &pwmB, &pwmC, &pwmD};
+uint8_t digitalPins[4] = {6, 9, 10, 11};
+
+
+// Apply PWM
+void applyDigitalPWM(uint8_t ch, uint32_t newFreq, uint8_t newDuty)
+{
+  if (ch >= 4) return;
+
+  if (newDuty > 100) newDuty = 100;
+
+  freq[ch] = newFreq;
+  duty[ch] = newDuty;
+
+  uint32_t period_us = 1000000UL / freq[ch];
+
+  pwm[ch]->begin(period_us, 0);
+
+  uint16_t val = (uint16_t)(duty[ch] * 4095UL / 100UL);
+  analogWrite(digitalPins[ch], val);
+}
+
+
+// Setup
+void setup()
+{
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("UNO R4 CAN PWM Controller (4CH)");
+
+  if (!CAN.begin(CanBitRate::BR_1000k)) {
+    Serial.println("CAN init failed");
+    while (1);
+  }
+
+  Serial.println("CAN ready");
+
+  analogWriteResolution(12);
+
+  enterSafeState();
+
+  for (uint8_t i = 0; i < 4; i++) {
+    applyDigitalPWM(i, freq[i], duty[i]);
+  }
+
+  lastNanoKeepAlive = millis();
+
+  Serial.println("PWM outputs initialized");
+
+}
+
+// Safe State
+void enterSafeState()
+{
+  for (uint8_t i = 0; i < 4; i++) {
+    applyDigitalPWM(i, 1000, 0);
+  }
+
+  Serial.println("SAFE STATE active");
+}
+
+
+// Keep Alive
+void sendKeepAlive()
+{
+  uint8_t data[8] = {0};
+
+  data[0] = 0x02;
+  data[1] = 0x01;
+  data[3] = keepaliveSeq++;
+
+  uint16_t uptime = millis() / 1000;
+
+  data[4] = uptime & 0xFF;
+  data[5] = uptime >> 8;
+
+  data[7] =
+    data[0]^data[1]^data[2]^data[3]^
+    data[4]^data[5]^data[6];
+
+  CanMsg msg(CanStandardId(KEEPALIVE_ID), 8, data);
+
+  CAN.write(msg);
+}
+
+
+// Handle CAN PWM
+void handleDigitalOutputCan(CanMsg msg)
+{
+  if (msg.data_length != 8) return;
+
+  uint8_t* d = msg.data;
+
+  // Check Type
+  if (d[0] != DO_CMD_TYPE) return;
+
+  // Checksum
+  if (calcChecksum(d) != d[7]) {
+    Serial.println("DO checksum error");
+    return;
+  }
+
+  uint8_t channel = d[1];
+  uint8_t duty    = d[2];
+  uint16_t freq   = d[3] | (d[4] << 8);
+
+  if (channel > 3) return;
+
+  applyDigitalPWM(channel, freq, duty);
+
+  Serial.print("RX DO → ch=");
+  Serial.print(channel);
+  Serial.print(" f=");
+  Serial.print(freq);
+  Serial.print("Hz d=");
+  Serial.print(duty);
+  Serial.println("%");
+}
+
+  // Read Analog
+void readAnalogInputs() {
+
+  for (int i = 0; i < NUM_ANALOG; i++) {
+    analogValues[i] = analogRead(analogPins[i]);
+  }
+}
+
+// Send CAN
+void sendAnalogCAN() {
+
+  uint8_t data[8];
+
+  for (int i = 0; i < NUM_ANALOG; i++) {
+
+    data[i * 2]     = lowByte(analogValues[i]);
+    data[i * 2 + 1] = highByte(analogValues[i]);
+  }
+
+  // Construct CAN message (STANDARD ID)
+  CanMsg msg(
+    CanStandardId(AVIsendCANAddress),
+    8,
+    data
+  );
+
+  int rc = CAN.write(msg);
+
+  if (rc < 0) {
+    Serial.print("CAN send failed: ");
+    Serial.println(rc);
+  }
+}
+
+// Debug
+void printAnalog() {
+
+  Serial.print("Analog: ");
+
+  for (int i = 0; i < NUM_ANALOG; i++) {
+
+    Serial.print("A");
+    Serial.print(i);
+    Serial.print("=");
+
+    Serial.print(analogValues[i]);
+
+    if (i < NUM_ANALOG - 1)
+      Serial.print(" | ");
+  }
+
+  Serial.println();
+}
+
+// Loop
+void loop()
+{
+  unsigned long now = millis();
+
+  // Keep Alive
+  if (now - lastKeepAliveSent >= KEEPALIVE_INTERVAL_MS) {
+    sendKeepAlive();
+    lastKeepAliveSent = now;
+  }
+
+  // CAN receive
+  if (CAN.available()) {
+
+    CanMsg msg = CAN.read();
+
+  /* Digital Output Command */
+    if (msg.id == DIGITAL_OUTPUT_CAN_ID && msg.data_length == 8) {
+      handleDigitalOutputCan(msg);
+  }
+
+  /* KeepAlive from Nano */
+    if (msg.id == KEEPALIVE_ID && msg.data_length == 8) {
+      lastNanoKeepAlive = now;
+  }
+}
+
+
+  // Watchdog
+  static bool timeoutShown = false;
+
+  if (now - lastNanoKeepAlive > NANO_TIMEOUT_MS) {
+
+    if (!timeoutShown) {
+      Serial.println("ERROR: Nano timeout → SAFE STATE");
+      enterSafeState();
+      timeoutShown = true;
+  }
+
+  } else {
+    timeoutShown = false;
+  }
+
+  // Serial Control
+  if (Serial.available()) {
+
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+
+    if (line == "status") {
+      Serial.println("System OK");
+    }
+    else if (line == "help") {
+      Serial.println("Commands: status, help, reset");
+    }
+    else if (line == "reset") {
+      Serial.println("Resetting...");
+      // reset logic here
+    }
+    else {
+      Serial.println("Unknown command");
+    }
+  }
+
+ // Analog
+  if (millis() - lastAnalogSend >= ANALOG_INTERVAL) {
+
+    readAnalogInputs();
+    sendAnalogCAN();
+    printAnalog();
+
+    lastAnalogSend = millis();
+  }
+}
