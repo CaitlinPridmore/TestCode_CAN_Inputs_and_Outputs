@@ -1,0 +1,225 @@
+// Byte Field Description
+// 0 Message Type   0x10 → Digital Output Command
+// 1 Channel        0–3 (corresponding to pins 6, 9, 10, 11)
+// 2 Duty           0–100% 
+// 3 Frequency LSB  16-bit PWM frequency, LSB
+// 4 Frequency MSB  16-bit PWM frequency, MSB
+// 5 Reserved       0x00
+// 6 Reserved.      0x00
+// 7 Checksum       XOR of bytes 0–6
+
+#include <SPI.h>
+#include <mcp_can.h>
+
+#define CAN_CS 10
+MCP_CAN CAN(CAN_CS);
+
+#define PWM_CH0_PIN 9   // Timer1
+#define PWM_CH1_PIN 3   // Timer2
+
+#define MSG_PWM_OUTPUT_CMD 0x01
+#define KEEPALIVE_ID 0x2C6
+#define KEEPALIVE_INTERVAL_MS 100  // Send every 100ms
+#define WATCHDOG_TIMEOUT_MS 500    // Trigger error if no UNO KeepAlive received
+#define NODE_ID 0x02               // Nano Node ID
+#define CAN_ID_ANALOG 0x2C0
+
+// Digital Output Message
+#define DO_CMD_TYPE 0x10
+#define DIGITAL_OUTPUT_CAN_ID 0x2D2  // CAN ID for digital output commands
+
+// Data Storage
+uint16_t analogValues[4];
+
+static uint8_t keepaliveSeq = 0;
+unsigned long lastKeepAlive = 0;
+unsigned long lastUnoKeepAlive = 0;
+unsigned long lastAnalogPrint = 0;
+const unsigned long ANALOG_PRINT_INTERVAL = 200; // milliseconds
+
+uint8_t calcChecksum(uint8_t* data)
+{
+  uint8_t c = 0;
+
+  for (int i = 0; i < 7; i++) {
+    c ^= data[i];
+  }
+
+  return c;
+}
+
+void setup() {
+  Serial.begin(115200);
+  while (!Serial);
+
+  Serial.println("Nano PWM CAN Receiver starting...");
+  Serial.println("Receiving");
+
+  pinMode(PWM_CH0_PIN, OUTPUT);
+  pinMode(PWM_CH1_PIN, OUTPUT);
+
+  // Timer setup
+  TCCR1A = TCCR1B = 0;
+  TCCR1A |= (1 << WGM11);
+  TCCR1B |= (1 << WGM12) | (1 << WGM13);
+  TCCR1A |= (1 << COM1A1);
+  TCCR1B |= (1 << CS11);
+  ICR1 = 19999; OCR1A = 0;
+
+  TCCR2A = TCCR2B = 0;
+  TCCR2A |= (1 << WGM21) | (1 << WGM20);
+  TCCR2A |= (1 << COM2B1);
+  TCCR2B |= (1 << CS22);
+  OCR2A = 255; OCR2B = 0;
+
+  while (CAN.begin(MCP_ANY, CAN_1000KBPS, MCP_8MHZ) != CAN_OK) {
+    Serial.println("CAN init failed, retrying...");
+    delay(1000);
+  }
+
+  CAN.setMode(MCP_NORMAL);
+  Serial.println("Nano ready (Timer1 + Timer2 PWM active)");
+}
+
+void sendDigitalOutput(uint8_t pin, uint8_t duty, uint16_t freq) {
+
+  if (pin > 3 || duty > 100 || freq == 0) {
+    Serial.println("Invalid DO parameters");
+    return;
+  }
+
+  uint8_t data[8] = {0};
+
+  data[0] = DO_CMD_TYPE;        // 0x10
+  data[1] = pin;           // 0–3
+  data[2] = duty;              // 0–100
+  data[3] = freq & 0xFF;        // LSB
+  data[4] = freq >> 8;          // MSB
+  data[5] = 0;                 // Reserved
+  data[6] = 0;                 // Reserved
+
+  // Checksum
+  data[7] = calcChecksum(data);
+
+  CAN.sendMsgBuf(DIGITAL_OUTPUT_CAN_ID, 0, 8, data);
+
+  // Serial feedback
+  Serial.print("Sent DO → Pin ");
+  Serial.print(pin);
+  Serial.print(" | Duty ");
+  Serial.print(duty);
+  Serial.print("% | Freq ");
+  Serial.print(freq);
+  Serial.println(" Hz");
+}
+
+
+void sendKeepAlive() {
+  uint8_t data[8] = {0};
+  data[0] = 0x02;               // KeepAlive message type
+  data[1] = NODE_ID;            // Node ID (Nano)
+  data[2] = 0x00;               // Status flags OK
+  data[3] = keepaliveSeq++;     // Sequence
+  uint16_t uptime = millis() / 1000; // seconds
+  data[4] = uptime & 0xFF;      // LSB
+  data[5] = (uptime >> 8) & 0xFF;// MSB
+  data[6] = 0x00;               // Reserved
+  data[7] = data[0]^data[1]^data[2]^data[3]^data[4]^data[5]^data[6]; // Checksum
+
+  CAN.sendMsgBuf(KEEPALIVE_ID, 0, 8, data);
+}
+
+void loop() {
+
+  unsigned long now = millis();
+
+  // Send Keep ALive
+  if (now - lastKeepAlive >= KEEPALIVE_INTERVAL_MS) {
+    sendKeepAlive();
+    lastKeepAlive = now;
+  }
+
+  // CAN Receive
+  if (CAN.checkReceive() == CAN_MSGAVAIL) {
+
+    long unsigned int rxId;
+    unsigned char len;
+    unsigned char buf[8];
+
+    CAN.readMsgBuf(&rxId, &len, buf);
+
+    if (len == 8) {
+
+      // Keep Alive from UNO
+      if (rxId == KEEPALIVE_ID) {
+        lastUnoKeepAlive = now;
+      }
+
+      // Analog Data
+      if (rxId == CAN_ID_ANALOG) {
+
+        for (int i = 0; i < 4; i++) {
+          analogValues[i] =
+            (uint16_t)buf[i * 2] |
+            ((uint16_t)buf[i * 2 + 1] << 8);
+        }
+
+  if (millis() - lastAnalogPrint >= ANALOG_PRINT_INTERVAL) {
+      Serial.println("Received Analog Values:");
+      for (int i = 0; i < 4; i++) {
+          Serial.print("A");
+          Serial.print(i);
+          Serial.print(": ");
+          Serial.println(analogValues[i]);
+      }
+      Serial.println("--------------------");
+
+      lastAnalogPrint = millis(); // reset timer
+}
+
+      }
+    }
+  }
+
+  // Serial Commands
+  if (Serial.available()) {
+
+    String cmd = Serial.readStringUntil('\n');
+    cmd.trim();
+
+    if (cmd.startsWith("D")) {
+
+      int pin, duty, freq;
+
+      int parsed = sscanf(
+        cmd.c_str(),
+        "D %d %d %d",
+        &pin,
+        &duty,
+        &freq
+      );
+
+      if (parsed == 3) {
+        sendDigitalOutput(pin, duty, freq);
+      }
+      else {
+        Serial.println("Format: D <pin> <duty> <freq>");
+        Serial.println("Example: D 1 50 1000");
+      }
+    }
+  }
+
+  // Watchdog
+  static bool errorShown = false;
+
+  if (now - lastUnoKeepAlive > WATCHDOG_TIMEOUT_MS) {
+
+    if (!errorShown) {
+      Serial.println("ERROR: UNO R4 KeepAlive missing!");
+      errorShown = true;
+    }
+
+  } else {
+    errorShown = false;
+  }
+}
